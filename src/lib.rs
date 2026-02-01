@@ -231,13 +231,16 @@ pub mod image_processing {
 
 pub mod audio_processing {
     pub mod scalar {
+
         /// Volume adjustment: multiply all samples by volume coefficient
         /// volume: 0.0 = mute, 1.0 = original volume, 2.0 = double volume
         pub fn adjust_volume(samples: &mut [i16], volume: f32) {
+            // Avoid the float conversion (as the neon implementation does)
+            // We scale the volume by 256, and then shift right by 8 bits to divide by 256
+            let vol_fixed = (volume * 256.0) as i32;
             for sample in samples.iter_mut() {
-                // Multiply by volume and clamp to i16 range
-                let adjusted = (*sample as f32 * volume) as i32;
-                *sample = adjusted.clamp(-32768, 32767) as i16;
+                let adjusted = (*sample as i32 * vol_fixed) >> 8;
+                *sample = adjusted.max(-32768).min(32767) as i16;
             }
         }
 

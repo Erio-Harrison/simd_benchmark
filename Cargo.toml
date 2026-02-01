@@ -11,3 +11,7 @@ criterion = "0.5"
 [[bench]]
 name = "simd_bench"
 harness = false
+
+
+# [profile.release]
+# debug=true
