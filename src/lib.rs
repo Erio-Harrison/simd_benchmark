@@ -254,6 +254,7 @@ pub mod audio_processing {
     }
 
     pub mod portable_simd {
+        use std::simd::num::SimdInt;
         use std::simd::*;
         use std::simd::cmp::SimdOrd;
 
@@ -273,27 +274,22 @@ pub mod audio_processing {
             let len = samples.len();
             let simd_len = len - (len % 8);
 
-            for i in (0..simd_len).step_by(8) {
+            for chunk in samples[..simd_len].chunks_exact_mut(8) {
                 // i16 → i32 (avoid multiplication overflow)
-                let mut vals = [0i32; 8];
-                for j in 0..8 {
-                    vals[j] = samples[i + j] as i32;
-                }
-                let v = i32x8::from_array(vals);
+                let vals = i16x8::from_slice(chunk);
+                let v : i32x8= vals.cast();
 
                 // Multiply then shift right 8 bits (divide by 256)
                 let adjusted = (v * vol_vec) >> Simd::splat(8);
 
                 // Clamp to i16 range
-                let clamped = adjusted.simd_clamp(
+                let clamped: i16x8 = adjusted.simd_clamp(
                     i32x8::splat(-32768),
                     i32x8::splat(32767),
-                );
+                ).cast();
 
                 // Write back
-                for (j, &val) in clamped.to_array().iter().enumerate() {
-                    samples[i + j] = val as i16;
-                }
+                clamped.copy_to_slice(chunk);
             }
 
             // Handle remainder
