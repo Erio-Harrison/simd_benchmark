@@ -25,7 +25,7 @@ Three implementations per scenario:
 
 | Scenario | Scalar | std::simd | NEON | std::simd | NEON |
 |----------|--------|-----------|------|-----------|------|
-| RGB→Grayscale | 6.16ms | 18.51ms | 1.45ms | **0.33x** | **4.26x** |
+| RGB→Grayscale | 6.16ms | 18.51ms | 1.45ms | **0.33x** | **1.26x** |
 | Volume Adjust | 1.39ms | 3.42ms | 0.82ms | **0.40x** | **1.70x** |
 | Audio Mixing | 0.63ms | 4.84ms | 0.53ms | **0.13x** | **1.20x** |
 | Count Newlines | 14.10ms | 3.22ms | 3.87ms | **4.38x** | **3.65x** |
