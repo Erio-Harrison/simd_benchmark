@@ -306,23 +306,16 @@ pub mod audio_processing {
 
             for i in (0..simd_len).step_by(8) {
                 // Load and convert to i32
-                let mut a_vals = [0i32; 8];
-                let mut b_vals = [0i32; 8];
-                for j in 0..8 {
-                    a_vals[j] = track_a[i + j] as i32;
-                    b_vals[j] = track_b[i + j] as i32;
-                }
-
-                let a = i32x8::from_array(a_vals);
-                let b = i32x8::from_array(b_vals);
+                let a: i32x8 = i16x8::from_slice(&track_a[i..i+8]).cast();
+                let b: i32x8 = i16x8::from_slice(&track_b[i..i+8]).cast();
 
                 // Mix: (a + b) / 2
                 let mixed = (a + b) >> Simd::splat(1);
 
+                // Downcast:
+                let mixed_i16 : i16x8 = mixed.cast();
                 // Write back
-                for (j, &val) in mixed.to_array().iter().enumerate() {
-                    output[i + j] = val as i16;
-                }
+                mixed_i16.copy_to_slice(&mut output[i..i+8]);
             }
 
             // Handle remainder
