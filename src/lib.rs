@@ -294,8 +294,8 @@ pub mod audio_processing {
 
             // Handle remainder
             for i in simd_len..len {
-                let adjusted = (samples[i] as f32 * volume) as i32;
-                samples[i] = adjusted.clamp(-32768, 32767) as i16;
+                let adjusted = (samples[i] as i32 * vol_fixed) >> 8;
+                samples[i] = adjusted.max(-32768).min(32767) as i16;
             }
         }
 
@@ -320,7 +320,7 @@ pub mod audio_processing {
 
             // Handle remainder
             for i in simd_len..len {
-                output[i] = ((track_a[i] as i32 + track_b[i] as i32) / 2) as i16;
+                output[i] = ((track_a[i] as i32 + track_b[i] as i32) >> 1) as i16;
             }
         }
     }
@@ -374,8 +374,8 @@ pub mod audio_processing {
 
             // Handle remainder
             for i in simd_len..len {
-                let adjusted = (samples[i] as f32 * volume) as i32;
-                samples[i] = adjusted.clamp(-32768, 32767) as i16;
+                let adjusted = (samples[i] as i32 * vol_fixed) >> 8;
+                samples[i] = adjusted.max(-32768).min(32767) as i16;
             }
         }
 
@@ -397,7 +397,7 @@ pub mod audio_processing {
             }
 
             for i in simd_len..len {
-                output[i] = ((track_a[i] as i32 + track_b[i] as i32) / 2) as i16;
+                output[i] = ((track_a[i] as i32 + track_b[i] as i32) >> 1) as i16;
             }
         }
     }
