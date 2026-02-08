@@ -304,18 +304,15 @@ pub mod audio_processing {
             let len = track_a.len().min(track_b.len()).min(output.len());
             let simd_len = len - (len % 8);
 
-            for i in (0..simd_len).step_by(8) {
-                // Load and convert to i32
-                let a: i32x8 = i16x8::from_slice(&track_a[i..i+8]).cast();
-                let b: i32x8 = i16x8::from_slice(&track_b[i..i+8]).cast();
+            for ((a_chunk, b_chunk), out_chunk) in track_a[..simd_len].chunks_exact(8)
+                .zip(track_b[..simd_len].chunks_exact(8))
+                .zip(output[..simd_len].chunks_exact_mut(8))
+            {
+                let a: i32x8 = i16x8::from_slice(a_chunk).cast();
+                let b: i32x8 = i16x8::from_slice(b_chunk).cast();
 
-                // Mix: (a + b) / 2
-                let mixed = (a + b) >> Simd::splat(1);
-
-                // Downcast:
-                let mixed_i16 : i16x8 = mixed.cast();
-                // Write back
-                mixed_i16.copy_to_slice(&mut output[i..i+8]);
+                let mixed: i16x8 = ((a + b) >> Simd::splat(1)).cast();
+                mixed.copy_to_slice(out_chunk);
             }
 
             // Handle remainder
