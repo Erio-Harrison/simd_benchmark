@@ -60,73 +60,48 @@ pub mod image_processing {
     }
 
     pub mod portable_simd {
-        use std::simd::*;
+        use std::simd::prelude::*;
 
         /// std::simd implementation: process 16 pixels at once
         ///
-        /// ## Core Syntax Explained
-        ///
-        /// ### 1. Type Aliases
-        /// - `u8x16`: Vector of 16 u8 values (128-bit)
-        /// - `u16x16`: Vector of 16 u16 values (256-bit)
-        /// - `u32x4`: Vector of 4 u32 values (128-bit)
-        ///
-        /// ### 2. Common Methods
-        /// - `splat(v)`: Fill entire vector with the same value
-        /// - `from_slice(s)`: Load data from a slice
-        /// - `copy_to_slice(s)`: Write vector to a slice
-        /// - `cast::<T>()`: Type conversion (preserving bit width)
-        ///
-        /// ### 3. Swizzle (Data Rearrangement)
-        /// One of SIMD's most powerful operations for rearranging vector elements
+        /// Uses `simd_swizzle!` to deinterleave RGB channels with SIMD shuffle,
+        /// avoiding scalar loops inside the SIMD main loop.
         pub fn rgb_to_grayscale(rgb: &[u8], gray: &mut [u8]) {
-            let chunks = rgb.chunks_exact(48); // 48 bytes = 16 pixels × 3 channels
-            let remainder = chunks.remainder();
+            let rgb_chunks = rgb.chunks_exact(48);
+            let rgb_remainder = rgb_chunks.remainder();
+            let mut gray_chunks = gray.chunks_exact_mut(16);
 
-            // Weight vectors for R, G, B channels
             let weight_r = u16x16::splat(77);
             let weight_g = u16x16::splat(150);
             let weight_b = u16x16::splat(29);
 
-            let mut out_idx = 0;
-            for chunk in chunks {
-                // Load 48 bytes of RGB data
-                // Memory layout: [R0,G0,B0, R1,G1,B1, R2,G2,B2, ...]
+            for (rgb_chunk, gray_chunk) in rgb_chunks.zip(gray_chunks.by_ref()) {
+                let rgb = Simd::<u8, 48>::from_slice(rgb_chunk);
 
-                // We need to deinterleave RGB into separate R, G, B vectors
-                // Using index extraction for each channel
-                let mut r_vals = [0u8; 16];
-                let mut g_vals = [0u8; 16];
-                let mut b_vals = [0u8; 16];
-
-                for i in 0..16 {
-                    r_vals[i] = chunk[i * 3];
-                    g_vals[i] = chunk[i * 3 + 1];
-                    b_vals[i] = chunk[i * 3 + 2];
+                const fn every_third(offset: usize) -> [usize; 16] {
+                    let mut retval = [0; 16];
+                    let mut i = 0;
+                    while i < retval.len() {
+                        retval[i] = i * 3 + offset;
+                        i += 1;
+                    }
+                    retval
                 }
 
-                // Convert to u16 to avoid multiplication overflow
-                // u8 max is 255, 255 * 150 = 38250, requires u16
-                let r = u16x16::from_array(r_vals.map(|x| x as u16));
-                let g = u16x16::from_array(g_vals.map(|x| x as u16));
-                let b = u16x16::from_array(b_vals.map(|x| x as u16));
+                let r: u16x16 = simd_swizzle!(rgb, every_third(0)).cast();
+                let g: u16x16 = simd_swizzle!(rgb, every_third(1)).cast();
+                let b: u16x16 = simd_swizzle!(rgb, every_third(2)).cast();
 
-                // Parallel computation: process 16 pixels at once
                 let gray_u16 = (r * weight_r + g * weight_g + b * weight_b) >> Simd::splat(8);
 
-                // Convert back to u8 and store
-                let gray_u8: [u8; 16] = gray_u16.to_array().map(|x| x as u8);
-                gray[out_idx..out_idx + 16].copy_from_slice(&gray_u8);
-                out_idx += 16;
+                let gray_u8: Simd<u8, 16> = gray_u16.cast();
+                gray_u8.copy_to_slice(gray_chunk);
             }
 
             // Handle remaining pixels (less than 16)
-            for chunk in remainder.chunks_exact(3) {
-                let r = chunk[0] as u32;
-                let g = chunk[1] as u32;
-                let b = chunk[2] as u32;
-                gray[out_idx] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
-                out_idx += 1;
+            let gray_remainder = gray_chunks.into_remainder();
+            for (pixel, out) in rgb_remainder.chunks_exact(3).zip(gray_remainder.iter_mut()) {
+                *out = ((77 * pixel[0] as u32 + 150 * pixel[1] as u32 + 29 * pixel[2] as u32) >> 8) as u8;
             }
         }
     }
