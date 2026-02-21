@@ -726,8 +726,8 @@ pub mod validation {
     }
 
     pub mod portable_simd {
-        use std::simd::*;
-        use std::simd::cmp::SimdPartialOrd;
+        use std::simd::prelude::*;
+        use std::iter;
 
         /// Check if all elements are within range
         ///
@@ -759,31 +759,39 @@ pub mod validation {
 
         /// Check if array is sorted in ascending order
         ///
-        /// ## Technique: Offset Comparison
-        ///
-        /// Compare [a0,a1,a2,a3] with [a1,a2,a3,a4]
+        /// Uses simd_swizzle to construct [prev_last, current[0..LANES-1]]
+        /// and compare against current to check sorted order.
         pub fn is_sorted(data: &[i32]) -> bool {
             if data.len() < 2 {
                 return true;
             }
 
-            for window in data.windows(9) {
-                let current = i32x8::from_slice(&window[0..8]);
-                let next = i32x8::from_slice(&window[1..9]);
-                if !current.simd_le(next).all() {
-                    return false;
+            const LANES: usize = 16;
+
+            const fn get_swizzle_mask() -> [usize; LANES] {
+                let mut arr = [0usize; LANES];
+                arr[0] = LANES;
+                let mut i = 1;
+                while i < LANES {
+                    arr[i] = i - 1;
+                    i += 1;
                 }
+                arr
             }
 
-            // Handle boundary cases
-            let remainder_start = (data.len() - 1) / 8 * 8;
-            for i in remainder_start.max(1)..data.len() {
-                if data[i - 1] > data[i] {
+            let chunks = data.chunks_exact(LANES);
+            let mut prev = Simd::splat(data[0]);
+            for current in chunks.clone().map(|arr| Simd::from_slice(arr)) {
+                let prev_current = simd_swizzle!(current, prev, get_swizzle_mask());
+                if !prev_current.simd_le(current).all() {
                     return false;
                 }
+                prev = current;
             }
 
-            true
+            iter::once(prev[prev.len() - 1])
+                .chain(chunks.remainder().iter().copied())
+                .is_sorted()
         }
     }
 
