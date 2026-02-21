@@ -770,7 +770,7 @@ pub mod validation {
 
             const fn get_swizzle_mask() -> [usize; LANES] {
                 let mut arr = [0usize; LANES];
-                arr[0] = LANES;
+                arr[0] = 2 * LANES - 1;
                 let mut i = 1;
                 while i < LANES {
                     arr[i] = i - 1;

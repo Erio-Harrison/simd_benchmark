@@ -369,7 +369,15 @@ fn main() {
     print_speedup(t_scalar, t_neon, "NEON     ");
     assert_eq!(result_scalar, result_simd, "std::simd result mismatch");
     assert_eq!(result_scalar, result_neon, "NEON result mismatch");
-    println!("  ✓ Correctness verified (result: {})\n", result_scalar);
+    println!("  ✓ Correctness verified (result: {})", result_scalar);
+
+    // Test with unsorted data: sorted within chunks but unsorted at chunk boundary
+    let mut unsorted_data: Vec<i32> = (0..10_000_000).map(|i| i as i32).collect();
+    unsorted_data[15] = 100;  // chunk boundary: [..., 100, 16, ...] should be caught
+    let unsorted_scalar = validation::scalar::is_sorted(&unsorted_data);
+    let unsorted_simd = validation::portable_simd::is_sorted(&unsorted_data);
+    assert_eq!(unsorted_scalar, unsorted_simd, "std::simd unsorted detection mismatch");
+    println!("  ✓ Unsorted detection verified (result: {})\n", unsorted_simd);
 
     // ========================================================================
     // Summary
