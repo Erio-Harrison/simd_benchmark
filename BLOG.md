@@ -1,17 +1,29 @@
 # Rust SIMD Benchmark: std::simd vs NEON on Apple M4
 
-A friend shared Sylvain Kerkour's post [SIMD programming in pure Rust](https://kerkour.com/simd-rust) which covers AVX-512 on AMD Zen 5. That got me curious about ARM's side of the story—specifically how `std::simd` compares to hand-written NEON intrinsics. My main development machine is a MacBook Pro with Apple M4, so I ran the benchmarks there.
+A friend shared Sylvain Kerkour's post [SIMD programming in pure Rust](https://kerkour.com/simd-rust), which covers AVX-512 on AMD Zen 5. That got me curious about ARM's side of the story, specifically how `std::simd` compares to hand-written NEON intrinsics. My main development machine is a MacBook Pro with Apple M4, so I ran the benchmarks there.
 
-I ran 9 benchmarks comparing three approaches: scalar, `std::simd`, and NEON. All numbers below are averaged from 3 runs.
+I ran 9 benchmarks comparing three approaches: scalar, `std::simd`, and NEON. All numbers below are median per-iteration times from `cargo run --release`, averaged over 3 runs.
 
-Key finding: `std::simd` ranged from **9x faster** to **7.7x slower** than scalar code. NEON always delivered speedups (1.2x–4.3x). The difference comes down to data layout—interleaved data like RGB images and stereo audio exposed limitations in the portable SIMD abstraction.
+**Key finding**: once the `std::simd` and NEON implementations are made structurally equivalent, they perform the same. Across all 9 scenarios the two APIs are within 5% of each other, except byte search where NEON keeps a 9% lead that traces to load addressing, not to SIMD. What actually moved the numbers was never the choice of API. It was vector width, the number of accumulators, how often the loop does a horizontal reduction, and the shape of the scalar loop around the SIMD code.
+
+## A Note on the Previous Version of This Post
+
+The first version of this post claimed that `std::simd` ranged from 9x faster to 7.7x slower than scalar code, with interleaved data (RGB, stereo audio) exposing "limitations in the portable SIMD abstraction." That conclusion was wrong, for two separate reasons.
+
+First, the original `std::simd` implementations deinterleaved RGB, widened i16 to i32, and narrowed back with per-element scalar loops and `from_array`. Those loops were the whole cost. Contributors (thanks to [nicofff](https://github.com/nicofff), PRs #3 to #10) replaced them with `from_slice`, `cast`, and `simd_swizzle!`, and the "7.7x slower" cases disappeared.
+
+Second, even after that, the comparison was not fair. The `std::simd` dot product used `f32x8` while the NEON version used a single `f32x4` accumulator. The `std::simd` byte counter used 32 lanes while NEON used 16. The sorted check used two different algorithms. Every remaining gap in the table traced back to one of these mismatches, not to the API.
+
+This rewrite uses the current code, where both SIMD versions of each scenario follow the same rules (see "Comparison Rules" in the README): same elements per iteration, same number of accumulators, same reduction frequency, same algorithm.
 
 ## Test Environment
 
 - **CPU**: Apple M4 (MacBook Pro 2024)
-- **Rust**: rustc 1.94.0-nightly (2026-01-14)
+- **Rust**: rustc 1.95.0-nightly (2026-02-01)
 - **OS**: macOS
-- **Command**: `cargo run --release`
+- **Command**: `cargo run --release`, 3 runs averaged
+- **Harness**: each implementation gets 100 ms of warmup, then 500 ms of timed iterations spread over 5 rounds. The three implementations of a scenario are measured round-robin (Scalar, std::simd, NEON, Scalar, ...) so clock drift and background noise hit all of them equally. The reported figure is the median per-iteration time, which gives between 100 samples (dot product) and 5,500 samples (RGB) per implementation.
+- **Code**: commit `a6e7bd6` and later
 
 Three implementations per scenario:
 
@@ -21,696 +33,307 @@ Three implementations per scenario:
 | std::simd | nightly | cross-platform |
 | std::arch (NEON) | stable | ARM64 only |
 
+A note on the harness, because it changed the numbers: the first version of this post ran each implementation 10 times in sequence and reported the mean. For a 0.1 ms workload that is 1 ms of measurement, before the CPU has ramped its clock or the scheduler has settled the process on a performance core, and the sub-millisecond rows varied by up to 2x between runs. With the time-budgeted, interleaved harness the medians agree to within 3% across runs, and the audio scenarios were enlarged from 10 s to 60 s of stereo so that one iteration is a few hundred microseconds and the working set comes from memory rather than L2, like every other scenario.
+
 ## Results Summary
 
 | Scenario | Scalar | std::simd | NEON | std::simd | NEON |
 |----------|--------|-----------|------|-----------|------|
-| RGB→Grayscale | 6.16ms | 18.51ms | 1.45ms | **0.33x** | **1.26x** |
-| Volume Adjust | 1.39ms | 3.42ms | 0.82ms | **0.40x** | **1.70x** |
-| Audio Mixing | 0.63ms | 4.84ms | 0.53ms | **0.13x** | **1.20x** |
-| Count Newlines | 14.10ms | 3.22ms | 3.87ms | **4.38x** | **3.65x** |
-| Find Byte | 24.07ms | 2.61ms | 2.68ms | **9.23x** | **9.00x** |
-| Dot Product | 51.20ms | 10.99ms | 20.14ms | **4.66x** | **2.54x** |
-| Matrix-Vec Mul | 4.48ms | 0.69ms | 1.35ms | **6.53x** | **3.32x** |
-| Range Check | 24.93ms | 8.24ms | 9.33ms | **3.02x** | **2.67x** |
-| Sorted Check | 25.14ms | 37.18ms | 6.87ms | **0.68x** | **3.66x** |
+| RGB→Grayscale (2M px) | 0.090ms | 0.090ms | 0.090ms | **1.00x** | **1.00x** |
+| Volume Adjust (5.3M) | 0.447ms | 0.450ms | 0.452ms | **0.99x** | **0.99x** |
+| Audio Mixing (5.3M) | 0.279ms | 0.280ms | 0.278ms | **1.00x** | **1.00x** |
+| Count Newlines (10MB) | 1.228ms | 0.193ms | 0.192ms | **6.36x** | **6.40x** |
+| Find Byte (10MB) | 2.494ms | 0.181ms | 0.165ms | **13.8x** | **15.1x** |
+| Dot Product (10M) | 4.987ms | 1.029ms | 1.059ms | **4.85x** | **4.71x** |
+| Matrix-Vec Mul (1024²) | 0.433ms | 0.077ms | 0.077ms | **5.62x** | **5.62x** |
+| Range Check (10M) | 2.486ms | 0.773ms | 0.775ms | **3.22x** | **3.21x** |
+| Sorted Check (10M) | 2.473ms | 0.548ms | 0.569ms | **4.51x** | **4.35x** |
 
-Three scenarios showed `std::simd` slower than scalar: RGB conversion (0.33x), audio mixing (0.13x), and sorted check (0.68x).
+Two things stand out. The two SIMD columns are nearly identical. And the three "interleaved data" scenarios show no speedup at all, for either API. The rest of this post explains both.
 
----
+For reference, here is what the same scenarios looked like one commit earlier, before the implementations were aligned (single run, same machine):
 
-## Scenario 1: RGB to Grayscale
+| Scenario | std::simd | NEON | What was different |
+|----------|-----------|------|--------------------|
+| Dot Product | 4.72x | 2.61x | `f32x8` vs one `f32x4` accumulator |
+| Matrix-Vec Mul | 6.60x | 3.15x | same, reused dot product |
+| Count Newlines | 4.68x | 7.54x | `u8x32` vs `u8x16` |
+| Range Check | 3.07x | 2.67x | `i32x8` vs `i32x4` |
+| Sorted Check | 4.70x | 3.58x | swizzle on 16 lanes vs overlapping loads on 4 |
 
-**Task**: Convert 1920×1080 RGB image to grayscale using ITU-R BT.601 formula.
-
-I used fixed-point arithmetic to avoid floating-point operations—much faster on integer pipelines: `Gray = (77*R + 150*G + 29*B) >> 8`
-
-### Scalar
-
-The scalar version is straightforward with `chunks_exact(3)`:
-
-```rust
-pub fn rgb_to_grayscale(rgb: &[u8], gray: &mut [u8]) {
-    for (i, chunk) in rgb.chunks_exact(3).enumerate() {
-        let r = chunk[0] as u32;
-        let g = chunk[1] as u32;
-        let b = chunk[2] as u32;
-        gray[i] = ((77 * r + 150 * g + 29 * b) >> 8) as u8;
-    }
-}
-```
-
-### std::simd
-
-```rust
-pub fn rgb_to_grayscale(rgb: &[u8], gray: &mut [u8]) {
-    let chunks = rgb.chunks_exact(48);
-    let weight_r = u16x16::splat(77);
-    let weight_g = u16x16::splat(150);
-    let weight_b = u16x16::splat(29);
-
-    let mut out_idx = 0;
-    for chunk in chunks {
-        // No deinterleave instruction available
-        // Must use scalar loop: 48 memory accesses per iteration
-        let mut r_vals = [0u8; 16];
-        let mut g_vals = [0u8; 16];
-        let mut b_vals = [0u8; 16];
-
-        for i in 0..16 {
-            r_vals[i] = chunk[i * 3];
-            g_vals[i] = chunk[i * 3 + 1];
-            b_vals[i] = chunk[i * 3 + 2];
-        }
-
-        let r = u16x16::from_array(r_vals.map(|x| x as u16));
-        let g = u16x16::from_array(g_vals.map(|x| x as u16));
-        let b = u16x16::from_array(b_vals.map(|x| x as u16));
-
-        let gray_u16 = (r * weight_r + g * weight_g + b * weight_b) >> Simd::splat(8);
-
-        let gray_u8: [u8; 16] = gray_u16.to_array().map(|x| x as u8);
-        gray[out_idx..out_idx + 16].copy_from_slice(&gray_u8);
-        out_idx += 16;
-    }
-}
-```
-
-### NEON
-
-```rust
-pub fn rgb_to_grayscale(rgb: &[u8], gray: &mut [u8]) {
-    unsafe {
-        let weight_r = vdupq_n_u8(77);
-        let weight_g = vdupq_n_u8(150);
-        let weight_b = vdupq_n_u8(29);
-
-        for i in (0..simd_len).step_by(16) {
-            // vld3q_u8: load + deinterleave in one instruction
-            // [R0,G0,B0,R1,G1,B1,...] → R[], G[], B[]
-            let rgb_data = vld3q_u8(rgb.as_ptr().add(i * 3));
-            let r = rgb_data.0;
-            let g = rgb_data.1;
-            let b = rgb_data.2;
-
-            // Widening multiply: u8 × u8 → u16
-            let r_lo = vmull_u8(vget_low_u8(r), vget_low_u8(weight_r));
-            let r_hi = vmull_high_u8(r, weight_r);
-            let g_lo = vmull_u8(vget_low_u8(g), vget_low_u8(weight_g));
-            let g_hi = vmull_high_u8(g, weight_g);
-            let b_lo = vmull_u8(vget_low_u8(b), vget_low_u8(weight_b));
-            let b_hi = vmull_high_u8(b, weight_b);
-
-            let sum_lo = vaddq_u16(vaddq_u16(r_lo, g_lo), b_lo);
-            let sum_hi = vaddq_u16(vaddq_u16(r_hi, g_hi), b_hi);
-
-            // Shift right + narrow: u16 → u8
-            let gray_lo = vshrn_n_u16(sum_lo, 8);
-            let gray_hi = vshrn_n_u16(sum_hi, 8);
-            let gray_vec = vcombine_u8(gray_lo, gray_hi);
-
-            vst1q_u8(gray.as_mut_ptr().add(i), gray_vec);
-        }
-    }
-}
-```
-
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 6.16ms | 1.0x |
-| std::simd | 18.51ms | 0.33x |
-| NEON | 1.45ms | 4.26x |
-
-**Analysis**: `vld3q_u8` performs load and 3-way deinterleave in one instruction. `std::simd` lacks this capability, requiring a 16-iteration scalar loop that dominates execution time.
+Each of these gaps looked like a statement about the API. None of them was.
 
 ---
 
-## Scenario 2: Audio Volume Adjustment
+## Finding 1: f32x8 Is Secretly Two Accumulators
 
-**Task**: Multiply 880K audio samples (i16) by gain factor 0.8.
+**Scenario**: dot product of two 10M-element f32 vectors.
 
-I used fixed-point here too—multiplying by 256 and shifting right 8 bits keeps everything in integer domain.
-
-### Scalar
+The original NEON implementation was the textbook version:
 
 ```rust
-pub fn adjust_volume(samples: &mut [i16], volume: f32) {
-    for sample in samples.iter_mut() {
-        let adjusted = (*sample as f32 * volume) as i32;
-        *sample = adjusted.clamp(-32768, 32767) as i16;
-    }
+let mut acc = vdupq_n_f32(0.0);
+for i in (0..simd_len).step_by(4) {
+    let va = vld1q_f32(a.as_ptr().add(i));
+    let vb = vld1q_f32(b.as_ptr().add(i));
+    acc = vfmaq_f32(acc, va, vb);
 }
+vaddvq_f32(acc)
 ```
 
-### std::simd
+Every iteration depends on the previous `acc`. The loop can run no faster than one FMA latency per 4 floats, regardless of how many FMA units the core has.
+
+The `std::simd` version used `f32x8`:
 
 ```rust
-pub fn adjust_volume(samples: &mut [i16], volume: f32) {
-    let vol_fixed = (volume * 256.0) as i32;
-    let vol_vec = i32x8::splat(vol_fixed);
-
-    for i in (0..simd_len).step_by(8) {
-        // No i16 → i32 widening instruction
-        let mut vals = [0i32; 8];
-        for j in 0..8 {
-            vals[j] = samples[i + j] as i32;
-        }
-        let v = i32x8::from_array(vals);
-
-        let adjusted = (v * vol_vec) >> Simd::splat(8);
-        let clamped = adjusted.simd_clamp(i32x8::splat(-32768), i32x8::splat(32767));
-
-        // No i32 → i16 narrowing instruction
-        for (j, &val) in clamped.to_array().iter().enumerate() {
-            samples[i + j] = val as i16;
-        }
-    }
+let mut acc = f32x8::splat(0.0);
+for (a_chunk, b_chunk) in chunks_a.zip(chunks_b) {
+    let va = f32x8::from_slice(a_chunk);
+    let vb = f32x8::from_slice(b_chunk);
+    acc = va.mul_add(vb, acc);
 }
+acc.reduce_sum()
 ```
 
-### NEON
+NEON registers are 128 bits, so there is no 8-wide f32 register. The compiler lowers `f32x8` to two registers and the loop body to two independent FMAs. That is two accumulation chains, and the CPU overlaps them. The "portable abstraction" was not generating smarter code. It was unrolled by two, and the hand-written version was not.
+
+Measured on the probe harness (median of 15, two separate runs):
+
+| Variant | Run 1 | Run 2 |
+|---------|-------|-------|
+| std::simd f32x4, 1 accumulator | 1.49ms | 1.50ms |
+| std::simd f32x8 (2 chains) | 1.06ms | 1.19ms |
+| std::simd f32x16 (4 chains) | 1.06ms | 1.20ms |
+| NEON f32x4, 1 accumulator | 2.59ms | 1.95ms |
+| NEON f32x4, 2 accumulators | 1.18ms | 1.09ms |
+| NEON f32x4, 4 accumulators | 1.11ms | 1.10ms |
+
+Two accumulators is where both APIs hit the memory bandwidth ceiling (80MB in about 1.1ms is roughly 75GB/s on one core). Going wider changes nothing. The current NEON code uses two explicit accumulators:
 
 ```rust
-pub fn adjust_volume(samples: &mut [i16], volume: f32) {
-    let vol_fixed = (volume * 256.0) as i32;
-
-    unsafe {
-        let vol_vec = vdupq_n_s32(vol_fixed);
-
-        for i in (0..simd_len).step_by(8) {
-            let v = vld1q_s16(samples.as_ptr().add(i));
-
-            // vmovl: widen i16 → i32
-            let v_lo = vmovl_s16(vget_low_s16(v));
-            let v_hi = vmovl_high_s16(v);
-
-            let mul_lo = vmulq_s32(v_lo, vol_vec);
-            let mul_hi = vmulq_s32(v_hi, vol_vec);
-
-            let shifted_lo = vshrq_n_s32(mul_lo, 8);
-            let shifted_hi = vshrq_n_s32(mul_hi, 8);
-
-            // vqmovn: saturating narrow i32 → i16
-            let result_lo = vqmovn_s32(shifted_lo);
-            let result_hi = vqmovn_s32(shifted_hi);
-            let result = vcombine_s16(result_lo, result_hi);
-
-            vst1q_s16(samples.as_mut_ptr().add(i), result);
-        }
-    }
+let mut acc0 = vdupq_n_f32(0.0);
+let mut acc1 = vdupq_n_f32(0.0);
+for i in (0..simd_len).step_by(8) {
+    acc0 = vfmaq_f32(acc0, vld1q_f32(a.as_ptr().add(i)), vld1q_f32(b.as_ptr().add(i)));
+    acc1 = vfmaq_f32(acc1, vld1q_f32(a.as_ptr().add(i + 4)), vld1q_f32(b.as_ptr().add(i + 4)));
 }
+vaddvq_f32(vaddq_f32(acc0, acc1))
 ```
 
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 1.39ms | 1.0x |
-| std::simd | 3.42ms | 0.40x |
-| NEON | 0.82ms | 1.70x |
-
-**Analysis**: `std::simd` lacks type conversion instructions. `vmovl` (widen) and `vqmovn` (saturating narrow) are single instructions in NEON but require scalar loops in `std::simd`.
+One more correction from the first version: the `std::simd` code used to read `acc += va * vb` with a comment calling it FMA. Rust never contracts a separate multiply and add into a fused one. If you want FMA you write `mul_add` (from `std::simd::StdFloat`). In this memory-bound loop it makes no measurable difference, but the comment was wrong and the numerics differ from the NEON version.
 
 ---
 
-## Scenario 3: Audio Mixing
+## Finding 2: `to_bitmask` on 32 Lanes Is a Trap on NEON
 
-**Task**: Mix two audio tracks using `(a + b) / 2` to prevent overflow.
+**Scenario**: count `\n` bytes in 10MB of text.
 
-Division by 2 is the classic way to mix audio without clipping. Simple but requires widening to i32 first.
-
-### Scalar
+The core loop is the same in both APIs: compare 16 bytes against the target, turn the mask into a count, accumulate.
 
 ```rust
-pub fn mix_tracks(track_a: &[i16], track_b: &[i16], output: &mut [i16]) {
-    for ((a, b), out) in track_a.iter().zip(track_b.iter()).zip(output.iter_mut()) {
-        *out = ((*a as i32 + *b as i32) / 2) as i16;
-    }
-}
+// std::simd
+let mask = u8x16::from_slice(chunk).simd_eq(target_vec);
+count += mask.to_bitmask().count_ones() as usize;
+
+// NEON
+let eq = vceqq_u8(v, target_vec);          // 0xFF where equal
+let ones = vshrq_n_u8(eq, 7);              // 0xFF -> 1
+count += vaddvq_u8(ones) as usize;
 ```
 
-### std::simd
+The first version of this post used `u8x32` for the `std::simd` side and explained its lead over NEON as "256-bit vectors versus 128-bit." The measurement said otherwise:
 
-```rust
-pub fn mix_tracks(track_a: &[i16], track_b: &[i16], output: &mut [i16]) {
-    for i in (0..simd_len).step_by(8) {
-        let mut a_vals = [0i32; 8];
-        let mut b_vals = [0i32; 8];
-        for j in 0..8 {
-            a_vals[j] = track_a[i + j] as i32;
-            b_vals[j] = track_b[i + j] as i32;
-        }
+| Variant | Run 1 | Run 2 |
+|---------|-------|-------|
+| std::simd u8x32 | 0.287ms | 0.318ms |
+| std::simd u8x16 | 0.193ms | 0.197ms |
+| NEON u8x16 | 0.181ms | 0.197ms |
 
-        let a = i32x8::from_array(a_vals);
-        let b = i32x8::from_array(b_vals);
-        let mixed = (a + b) >> Simd::splat(1);
+Wider was slower. x86 has `movemask`, which turns a byte mask into a bitmask in one instruction. NEON has nothing like it, so a 32-lane bitmask has to be assembled from two registers on every iteration. I did not keep the 32-lane assembly, so treat the mechanism as the likely explanation and the timing as the fact.
 
-        for (j, &val) in mixed.to_array().iter().enumerate() {
-            output[i + j] = val as i16;
-        }
-    }
-}
-```
+At 16 lanes the two APIs do not just perform the same, they compile to the same thing. In the release assembly both `count_byte` loops contain one `sdot` and one `addv`: LLVM recognized both the `to_bitmask().count_ones()` idiom and the `vshrq_n_u8` + `vaddvq_u8` idiom and replaced them with a dot-product popcount. Neither version runs the instructions its source code names.
 
-### NEON
+### A 15% gap that had nothing to do with SIMD
 
-```rust
-pub fn mix_tracks(track_a: &[i16], track_b: &[i16], output: &mut [i16]) {
-    unsafe {
-        for i in (0..simd_len).step_by(8) {
-            let a = vld1q_s16(track_a.as_ptr().add(i));
-            let b = vld1q_s16(track_b.as_ptr().add(i));
+The byte search scenario was the one place where NEON kept a lead after alignment: 0.157ms against 0.181ms. Both loops test "any lane set?" each iteration and only extract the position on a hit, and both compile that test to a single `umaxv`. The hot loops were eight instructions each. So where did 15% come from?
 
-            // vhaddq: halving add, computes (a + b) / 2 without overflow
-            let mixed = vhaddq_s16(a, b);
+Swapping the loop *shapes* between the two APIs answered it (probe harness, median of 7 rounds):
 
-            vst1q_s16(output.as_mut_ptr().add(i), mixed);
-        }
-    }
-}
-```
+| Variant | Time |
+|---------|------|
+| std::simd, `chunks_exact().enumerate()` (old code) | 0.194ms |
+| std::simd, `chunks_exact()` with a manual offset | 0.169ms |
+| std::simd, index loop with raw pointer loads | 0.157ms |
+| std::simd, index loop with `&data[i..i+16]` | 0.229ms |
+| NEON, index loop with raw pointer loads (repo) | 0.157ms |
+| NEON, `chunks_exact()` iterator | 0.174ms |
 
-### Results
+The gap follows the loop shape, not the API. Give `std::simd` the NEON loop and it runs at NEON speed; give NEON the iterator loop and it slows down to the `std::simd` number. Two things were going on:
 
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 0.63ms | 1.0x |
-| std::simd | 4.84ms | 0.13x |
-| NEON | 0.53ms | 1.20x |
+- `.enumerate()` adds a second loop counter. In a loop that already runs at about one iteration per cycle (10MB in 0.16ms is 655K iterations in roughly 630K cycles), one extra integer op per iteration is a measurable 13%. Tracking the offset by hand removes it.
+- `chunks_exact` lowers to a pointer-bump loop with a post-indexed load (`ldr q, [x], #16`), while the index loop lowers to base-plus-index addressing (`ldr q, [base, idx]`). On M4 the writeback form is a further 5 to 7% slower in this loop.
 
-**Analysis**: `vhaddq_s16` performs halving add in one instruction—designed specifically for audio mixing. `std::simd` requires widening to i32, adding, shifting, and narrowing back, plus three scalar loops for type conversions.
+The bounds-checked slice variant is the slowest of all: `from_slice` asserts the slice length on every iteration and LLVM does not prove it away.
+
+The repository now uses the manual-offset form, which is still safe code. That removes the counter but keeps the post-indexed load, so NEON stays about 9% ahead in the results table (0.165ms vs 0.181ms). Closing the last few percent would mean raw pointer loads on the `std::simd` side, and I would rather keep that version safe and document the difference. The lesson generalizes beyond SIMD: when a loop is already at one iteration per cycle, iterator adaptors that look free are not, and neither is the addressing mode the compiler picks for you.
 
 ---
 
-## Scenario 4: Counting Newlines
+## Finding 3: `vextq` Is `simd_swizzle!`
 
-**Task**: Count occurrences of `\n` in 10MB text.
+**Scenario**: check that 10M i32 values are sorted ascending.
 
-This is where SIMD really shines—contiguous data with simple comparison. I used `filter().count()` for scalar, which Rust's iterator makes clean.
+The two implementations used to use different algorithms. `std::simd` built a "previous element" vector with `simd_swizzle!` and compared it to the current chunk, 16 lanes at a time. NEON loaded overlapping windows (`data[i..i+4]` and `data[i+1..i+5]`), 4 lanes at a time. `std::simd` won, 4.70x to 3.58x, and the gap looked like an API difference.
 
-### Scalar
-
-```rust
-pub fn count_byte(data: &[u8], target: u8) -> usize {
-    data.iter().filter(|&&b| b == target).count()
-}
-```
-
-### std::simd
+It was two differences: algorithm and width. NEON has a direct equivalent of the swizzle. `vextq_s32(a, b, 3)` concatenates two vectors and extracts four lanes starting at index 3, giving `[a3, b0, b1, b2]`. That is exactly "shift the previous chunk's last element in front of the current chunk."
 
 ```rust
-pub fn count_byte(data: &[u8], target: u8) -> usize {
-    let target_vec = u8x32::splat(target);
-    let chunks = data.chunks_exact(32);
-    let mut count = 0usize;
+// std::simd: mask = [2*LANES-1, 0, 1, ..., LANES-2]
+let prev_current = simd_swizzle!(current, prev, get_swizzle_mask());
+if !prev_current.simd_le(current).all() { return false; }
+prev = current;
 
-    for chunk in chunks {
-        let v = u8x32::from_slice(chunk);
-        let mask = v.simd_eq(target_vec);
-        count += mask.to_bitmask().count_ones() as usize;
-    }
-
-    count += chunks.remainder().iter().filter(|&&b| b == target).count();
-    count
-}
+// NEON, 16 elements per iteration
+let s0 = vextq_s32(prev, c0, 3);
+let s1 = vextq_s32(c0, c1, 3);
+let s2 = vextq_s32(c1, c2, 3);
+let s3 = vextq_s32(c2, c3, 3);
+let ok = vandq_u32(
+    vandq_u32(vcleq_s32(s0, c0), vcleq_s32(s1, c1)),
+    vandq_u32(vcleq_s32(s2, c2), vcleq_s32(s3, c3)),
+);
+if vminvq_u32(ok) == 0 { return false; }
+prev = c3;
 ```
 
-### NEON
+This is not just an analogy. In the release assembly the `std::simd` function contains four `ext` instructions and one `umaxv`, and so does the NEON function. The swizzle lowered to exactly the instruction the NEON code names.
 
-```rust
-pub fn count_byte(data: &[u8], target: u8) -> usize {
-    let mut count = 0usize;
+With the same algorithm at the same width, the two APIs are indistinguishable:
 
-    unsafe {
-        let target_vec = vdupq_n_u8(target);
+| Variant | Time |
+|---------|------|
+| std::simd overlapping loads, 4 lanes | 0.673ms |
+| NEON overlapping loads, 4 lanes | 0.691ms |
+| std::simd swizzle, 16 lanes | 0.513ms |
+| std::simd overlapping loads, 16 lanes | 0.544ms |
+| NEON `vextq`, 16 lanes | 0.554ms |
 
-        for i in (0..simd_len).step_by(16) {
-            let v = vld1q_u8(data.as_ptr().add(i));
-            let eq = vceqq_u8(v, target_vec);
-            let ones = vshrq_n_u8(eq, 7);
-            count += vaddvq_u8(ones) as usize;
-        }
-    }
-
-    count
-}
-```
-
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 14.10ms | 1.0x |
-| std::simd | 3.22ms | 4.38x |
-| NEON | 3.87ms | 3.65x |
-
-**Analysis**: Contiguous data, simple comparison, no type conversions. Both SIMD approaches perform well. `std::simd` uses 256-bit vectors, NEON uses 128-bit, explaining the slight `std::simd` advantage.
+The remaining 6% in the results table is within run-to-run noise.
 
 ---
 
-## Scenario 5: Finding a Byte
+## Finding 4: The Scalar Baseline Is Already SIMD
 
-**Task**: Find position of `@` in 10MB data (target near end).
+**Scenarios**: volume adjustment and two-track mixing on 5.3M i16 samples (60 s of 44.1 kHz stereo).
 
-I placed the target byte near the end to simulate worst-case search. The `position()` iterator is nice for scalar.
+Both audio scenarios show 1.00x for both SIMD APIs. The first version of this post reported 0.40x and 0.13x for `std::simd` and read it as the portable API lacking widening, narrowing, and halving-add instructions. The current `std::simd` code uses `cast` for the conversions and runs at exactly the same speed as NEON. But it also runs at exactly the same speed as the scalar code, and that deserves an explanation.
 
-### Scalar
-
-```rust
-pub fn find_byte(data: &[u8], target: u8) -> Option<usize> {
-    data.iter().position(|&b| b == target)
-}
-```
-
-### std::simd
+The scalar mixer is one line:
 
 ```rust
-pub fn find_byte(data: &[u8], target: u8) -> Option<usize> {
-    let target_vec = u8x32::splat(target);
-    let chunks = data.chunks_exact(32);
-
-    for (chunk_idx, chunk) in chunks.enumerate() {
-        let v = u8x32::from_slice(chunk);
-        let mask = v.simd_eq(target_vec);
-        let bitmask = mask.to_bitmask();
-        if bitmask != 0 {
-            return Some(chunk_idx * 32 + bitmask.trailing_zeros() as usize);
-        }
-    }
-
-    None
-}
+*out = ((*a as i32 + *b as i32) >> 1) as i16;
 ```
 
-### NEON
+Here is what the release build turns it into (instruction histogram of the function body):
 
-```rust
-pub fn find_byte(data: &[u8], target: u8) -> Option<usize> {
-    let len = data.len();
-    let simd_len = len - (len % 16);
-
-    unsafe {
-        let target_vec = vdupq_n_u8(target);
-
-        for i in (0..simd_len).step_by(16) {
-            let v = vld1q_u8(data.as_ptr().add(i));
-            let eq = vceqq_u8(v, target_vec);
-            // vmaxvq_u8: if any 0xFF exists, returns 0xFF
-            if vmaxvq_u8(eq) != 0 {
-                // Found match, linear search for exact position
-                for j in 0..16 {
-                    if data[i + j] == target {
-                        return Some(i + j);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
+```
+   4 shadd.8h
+   4 ldp
+   2 stp
+   ...
 ```
 
-### Results
+`shadd.8h` is the signed halving add on eight 16-bit lanes. It is the same instruction the NEON version calls through `vhaddq_s16`. LLVM auto-vectorized the scalar loop into the hand-written NEON code. It went one step further with the `std::simd` version, too: that code widens to `i32x8`, adds, shifts, and narrows back, and LLVM folded the whole sequence into `shadd` as well. All three mixers are the same instruction.
 
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 24.07ms | 1.0x |
-| std::simd | 2.61ms | 9.23x |
-| NEON | 2.68ms | 9.00x |
+The volume adjustment is the same story: the scalar function compiles to `mul.4s`, `sshll.4s`, `sqshrn.4h`, which is widen, multiply, saturating narrow. And the RGB conversion's scalar loop contains `ld3` followed by `umull.8h` and `umlal2.8h`: the compiler found the deinterleaving load on its own.
 
-**Analysis**: Best-case SIMD scenario. Compare 32 bytes per iteration, early exit on match.
+So in those three rows, the table compares NEON code to NEON code to NEON code. Five different hand-written variants of the mixer, including one that widens to i32 and one that stays in i16 lanes, all measure 0.051ms on the probe harness at 882K samples. The loop is memory-bound and the instruction choice does not matter.
+
+The lesson is not "SIMD does not help audio." It is that the scalar baseline in a SIMD benchmark is not what it looks like, and a 1.0x result can mean the compiler got there first. If you want to know whether explicit SIMD helps, check the baseline's assembly before drawing conclusions.
 
 ---
 
-## Scenario 6: Dot Product
+## The Scenarios
 
-**Task**: Dot product of two 10M-element f32 vectors.
+Full code for all three implementations of every scenario is in [`src/lib.rs`](https://github.com/Erio-Harrison/simd_benchmark/blob/master/src/lib.rs). Below are the parts that matter for each one.
 
-Classic numerical computing workload. Rust's iterator chain makes the scalar version readable.
+### RGB to Grayscale
 
-### Scalar
+1920×1080 image, fixed-point BT.601: `Gray = (77*R + 150*G + 29*B) >> 8`. Both SIMD versions process 16 pixels (48 bytes) per iteration.
 
-```rust
-pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-```
-
-### std::simd
+NEON has `vld3q_u8`, which loads 48 bytes and deinterleaves them into three registers in one instruction. `std::simd` does the same thing with a 48-lane load and three `simd_swizzle!` calls using a compile-time "every third byte" mask:
 
 ```rust
-pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    let chunks_a = a.chunks_exact(8);
-    let chunks_b = b.chunks_exact(8);
-
-    let mut acc = f32x8::splat(0.0);
-
-    for (a_chunk, b_chunk) in chunks_a.zip(chunks_b) {
-        let va = f32x8::from_slice(a_chunk);
-        let vb = f32x8::from_slice(b_chunk);
-        acc += va * vb;
-    }
-
-    acc.reduce_sum()
-}
+let rgb = Simd::<u8, 48>::from_slice(rgb_chunk);
+let r: u16x16 = simd_swizzle!(rgb, every_third(0)).cast();
+let g: u16x16 = simd_swizzle!(rgb, every_third(1)).cast();
+let b: u16x16 = simd_swizzle!(rgb, every_third(2)).cast();
+let gray_u16 = (r * weight_r + g * weight_g + b * weight_b) >> Simd::splat(8);
+let gray_u8: Simd<u8, 16> = gray_u16.cast();
 ```
 
-### NEON
+I expected the swizzle to lower to table lookups. It does not: LLVM recognizes the every-third-byte pattern and emits `ld3`, the same instruction the NEON code calls through `vld3q_u8`. The scalar version is auto-vectorized with `ld3` as well (see Finding 4), which is why all three rows are within a few percent of each other.
+
+### Volume Adjustment and Mixing
+
+See Finding 4. Both SIMD versions process 8 samples per iteration. The `std::simd` volume code widens with `cast`, multiplies in i32, shifts, clamps, and narrows with `cast`. NEON does the same with `vmovl`, `vmulq`, `vshrq_n`, `vqmovn`.
+
+### Count Newlines and Find Byte
+
+See Finding 2. Both APIs use 16 lanes.
+
+### Dot Product and Matrix-Vector Multiplication
+
+See Finding 1. Matrix-vector multiplication calls the dot product once per row, so it inherits the same behavior: identical speed once the accumulator count matches.
+
+### Range Check
+
+Both versions process 8 i32 per iteration with one horizontal reduction. `std::simd`:
 
 ```rust
-pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    unsafe {
-        let mut acc = vdupq_n_f32(0.0);
-
-        for i in (0..simd_len).step_by(4) {
-            let va = vld1q_f32(a.as_ptr().add(i));
-            let vb = vld1q_f32(b.as_ptr().add(i));
-            acc = vfmaq_f32(acc, va, vb);
-        }
-
-        vaddvq_f32(acc)
-    }
-}
+let v = i32x8::from_slice(chunk);
+if !(v.simd_ge(min_vec) & v.simd_le(max_vec)).all() { return false; }
 ```
 
-### Results
+NEON, two registers, one `vminvq`:
 
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 51.20ms | 1.0x |
-| std::simd | 10.99ms | 4.66x |
-| NEON | 20.14ms | 2.54x |
+```rust
+let ok0 = vandq_u32(vcgeq_s32(v0, min_vec), vcleq_s32(v0, max_vec));
+let ok1 = vandq_u32(vcgeq_s32(v1, min_vec), vcleq_s32(v1, max_vec));
+if vminvq_u32(vandq_u32(ok0, ok1)) == 0 { return false; }
+```
 
-**Analysis**: `std::simd` outperforms hand-written NEON. `std::simd` uses f32x8 (256-bit), while the NEON implementation uses f32x4 (128-bit). The compiler generates efficient code from the portable abstraction.
+Before alignment the NEON loop did 4 elements and a reduction per iteration and came in at 2.67x against 3.07x. Now they are 3.20x and 3.24x.
+
+### Sorted Check
+
+See Finding 3.
 
 ---
 
-## Scenario 7: Matrix-Vector Multiplication
+## What the Comparison Actually Measures
 
-**Task**: 1024×1024 matrix times 1024-element vector.
+Here is the rule this repository now follows, and the one I would suggest for any `std::simd` versus intrinsics comparison:
 
-I reused the dot product implementation row by row—keeps the code simple.
+1. Same elements per iteration in both versions.
+2. Same number of accumulators and dependency chains.
+3. Same number of horizontal reductions per element.
+4. Same algorithm.
 
-### Scalar
+If you hold those fixed, the choice between `std::simd` and `std::arch` on aarch64 is not a performance choice. It is a choice about portability, stability (nightly versus stable), and how the code reads. Every performance difference I found in nine scenarios was explained by a violation of one of the four rules, or, in the byte search case, by the scalar loop machinery and load addressing around the SIMD instructions.
 
-```rust
-pub fn matrix_vector_mul(matrix: &[f32], vector: &[f32], result: &mut [f32], rows: usize, cols: usize) {
-    for i in 0..rows {
-        let row_start = i * cols;
-        result[i] = matrix[row_start..row_start + cols]
-            .iter()
-            .zip(vector.iter())
-            .map(|(m, v)| m * v)
-            .sum();
-    }
-}
-```
+That cuts both ways. The things that made `std::simd` look bad in the first version (scalar conversion loops) and the things that made it look good (an implicit unroll the NEON code did not have) were both artifacts of how the two sides were written.
 
-### std::simd
+## Recommendations
 
-```rust
-pub fn matrix_vector_mul(matrix: &[f32], vector: &[f32], result: &mut [f32], rows: usize, cols: usize) {
-    for i in 0..rows {
-        let row = &matrix[i * cols..(i + 1) * cols];
-        result[i] = dot_product(row, vector);  // reuse SIMD dot product
-    }
-}
-```
-
-### NEON
-
-```rust
-pub fn matrix_vector_mul(matrix: &[f32], vector: &[f32], result: &mut [f32], rows: usize, cols: usize) {
-    for i in 0..rows {
-        let row = &matrix[i * cols..(i + 1) * cols];
-        result[i] = dot_product(row, vector);  // reuse NEON dot product
-    }
-}
-```
-
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 4.48ms | 1.0x |
-| std::simd | 0.69ms | 6.53x |
-| NEON | 1.35ms | 3.32x |
-
-**Analysis**: Regular memory access pattern, same characteristics as dot product.
-
----
-
-## Scenario 8: Range Check
-
-**Task**: Verify all 10M i32 values are in `[0, 100)`.
-
-Early exit on failure makes this fast when data is invalid. I kept all values in range to measure worst-case (full scan).
-
-### Scalar
-
-```rust
-pub fn all_in_range(data: &[i32], min: i32, max: i32) -> bool {
-    data.iter().all(|&x| x >= min && x <= max)
-}
-```
-
-### std::simd
-
-```rust
-pub fn all_in_range(data: &[i32], min: i32, max: i32) -> bool {
-    let min_vec = i32x8::splat(min);
-    let max_vec = i32x8::splat(max);
-
-    for chunk in data.chunks_exact(8) {
-        let v = i32x8::from_slice(chunk);
-        let ge_min = v.simd_ge(min_vec);
-        let le_max = v.simd_le(max_vec);
-        if !(ge_min & le_max).all() {
-            return false;
-        }
-    }
-
-    true
-}
-```
-
-### NEON
-
-```rust
-pub fn all_in_range(data: &[i32], min: i32, max: i32) -> bool {
-    let len = data.len();
-    let simd_len = len - (len % 4);
-
-    unsafe {
-        let min_vec = vdupq_n_s32(min);
-        let max_vec = vdupq_n_s32(max);
-
-        for i in (0..simd_len).step_by(4) {
-            let v = vld1q_s32(data.as_ptr().add(i));
-            let ge_min = vcgeq_s32(v, min_vec);
-            let le_max = vcleq_s32(v, max_vec);
-            let both = vandq_u32(ge_min, le_max);
-            // vminvq: if any 0 exists, returns 0
-            if vminvq_u32(both) == 0 {
-                return false;
-            }
-        }
-    }
-
-    true
-}
-```
-
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 24.93ms | 1.0x |
-| std::simd | 8.24ms | 3.02x |
-| NEON | 9.33ms | 2.67x |
-
-**Analysis**: Simple comparisons on contiguous i32 data. No type conversions needed.
-
----
-
-## Scenario 9: Sorted Check
-
-**Task**: Verify 10M i32 values are sorted ascending.
-
-I used pre-sorted data to measure full-scan performance. The `windows()` iterator is convenient but has overhead.
-
-### Scalar
-
-```rust
-pub fn is_sorted(data: &[i32]) -> bool {
-    data.windows(2).all(|w| w[0] <= w[1])
-}
-```
-
-### std::simd
-
-```rust
-pub fn is_sorted(data: &[i32]) -> bool {
-    for window in data.windows(9) {
-        let current = i32x8::from_slice(&window[0..8]);
-        let next = i32x8::from_slice(&window[1..9]);
-        if !current.simd_le(next).all() {
-            return false;
-        }
-    }
-    true
-}
-```
-
-### NEON
-
-```rust
-pub fn is_sorted(data: &[i32]) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i + 4 < data.len() {
-            let current = vld1q_s32(data.as_ptr().add(i));
-            let next = vld1q_s32(data.as_ptr().add(i + 1));
-            let le = vcleq_s32(current, next);
-            if vminvq_u32(le) == 0 {
-                return false;
-            }
-            i += 4;
-        }
-    }
-    true
-}
-```
-
-### Results
-
-| Implementation | Time | vs Scalar |
-|----------------|------|-----------|
-| Scalar | 25.14ms | 1.0x |
-| std::simd | 37.18ms | 0.68x |
-| NEON | 6.87ms | 3.66x |
-
-**Analysis**: `windows(9)` iterator creates overlapping slices with overhead. NEON uses direct pointer arithmetic.
-
----
-
-## Root Cause Analysis
-
-After digging into the assembly, the pattern became clear. `std::simd` exposes only operations available across all target platforms. ARM-specific instructions cannot be represented:
-
-| Operation | std::simd | NEON |
-|-----------|-----------|------|
-| Deinterleave load | scalar loop | `vld3q_u8` |
-| Widen i16→i32 | scalar loop | `vmovl_s16` |
-| Saturating narrow i32→i16 | manual clamp | `vqmovn_s32` |
-| Halving add | add + shift + narrow | `vhaddq_s16` |
-
-When these operations are needed, `std::simd` falls back to scalar loops, negating SIMD benefits and adding overhead.
-
----
+| Situation | Approach |
+|-----------|----------|
+| Need stable Rust | `std::arch` intrinsics behind `cfg(target_arch)` |
+| Need one code path for ARM and x86 | `std::simd` |
+| Choosing a lane count | Match the hardware register, or a small multiple of it. Wider is not free: `to_bitmask` on 32 lanes is slower than on 16 on NEON. |
+| Reductions in a loop | Count them. `f32x8` on NEON already gives you two chains; a single intrinsic accumulator does not. |
+| Interpreting "1.0x" | Read the scalar assembly first. The compiler may have vectorized it. |
+| Loops near one iteration per cycle | Iterator adaptors are not free. `.enumerate()` on `chunks_exact` cost 13% in the byte search. |
 
 ## NEON Instruction Reference
 
@@ -724,40 +347,29 @@ vld3q_u8
 │└───── v: vector
 ```
 
-| Instruction | Operation |
-|-------------|-----------|
-| `vld1q_u8` | Load 16 bytes |
-| `vld3q_u8` | Load + deinterleave RGB |
-| `vmull_u8` | Widening multiply u8→u16 |
-| `vmovl_s16` | Widen i16→i32 |
-| `vqmovn_s32` | Saturating narrow i32→i16 |
-| `vfmaq_f32` | Fused multiply-add |
-| `vhaddq_s16` | Halving add |
-| `vaddvq_f32` | Horizontal sum |
+| Instruction | Operation | std::simd equivalent |
+|-------------|-----------|----------------------|
+| `vld1q_u8` | Load 16 bytes | `Simd::from_slice` |
+| `vld3q_u8` | Load + deinterleave RGB | `from_slice` + three `simd_swizzle!` (lowers to `ld3`) |
+| `vextq_s32(a, b, 3)` | `[a3, b0, b1, b2]` | `simd_swizzle!(b, a, [7, 0, 1, 2])` |
+| `vmull_u8` | Widening multiply u8→u16 | `cast::<u16>()` then `*` |
+| `vmovl_s16` | Widen i16→i32 | `cast::<i32>()` |
+| `vqmovn_s32` | Saturating narrow i32→i16 | `simd_clamp` then `cast::<i16>()` |
+| `vfmaq_f32` | Fused multiply-add | `mul_add` (not `a * b + c`) |
+| `vhaddq_s16` | Halving add | `((a.cast::<i32>() + b.cast::<i32>()) >> 1).cast()` (lowers to `shadd`) |
+| `vaddvq_f32` | Horizontal sum | `reduce_sum` |
+| `vminvq_u32` on a mask | "All lanes true?" | `Mask::all` |
+| `vmaxvq_u8` on a mask | "Any lane true?" | `Mask::any` |
 
----
+## Reproducing
 
-## Recommendations
+```bash
+rustup override set nightly
+cargo run --release    # correctness checks + quick timings
+cargo bench            # criterion, HTML reports in target/criterion/
+```
 
-| Data Pattern | Approach |
-|--------------|----------|
-| Contiguous f32/i32 arrays | std::simd |
-| Interleaved data (RGB, stereo audio) | Platform intrinsics |
-| Operations requiring type conversion | Platform intrinsics |
-| Cross-platform library | std::simd + scalar fallback |
-| Maximum ARM performance | NEON intrinsics |
-
----
-
-## Conclusion
-
-My takeaway: `std::simd` is great for numerical workloads on contiguous data—often better than hand-written intrinsics because the compiler knows optimization tricks I don't.
-
-But for image and audio processing, `std::simd` falls short. The portable abstraction cannot express instructions like `vld3q_u8` or `vhaddq_s16` that ARM provides specifically for these workloads.
-
-If we're targeting ARM and working with interleaved data, NEON intrinsics remain the way to go.
-
----
+The numbers in the first version of this post can be reproduced from commit `ca8a510` and earlier. The aligned implementations are in `a6e7bd6` and later.
 
 ## References
 
@@ -765,8 +377,6 @@ If we're targeting ARM and working with interleaved data, NEON intrinsics remain
 - [Rust std::arch::aarch64](https://doc.rust-lang.org/std/arch/aarch64/index.html) - ARM64 intrinsics in Rust
 - [ARM NEON Intrinsics Reference](https://developer.arm.com/architectures/instruction-sets/intrinsics/) - Official ARM intrinsics search
 - [ARM NEON Programmer's Guide](https://developer.arm.com/documentation/den0018/a/) - NEON architecture overview
-
----
 
 ## Source
 
