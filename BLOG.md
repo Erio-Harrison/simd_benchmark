@@ -10,7 +10,7 @@ I ran 9 benchmarks comparing three approaches: scalar, `std::simd`, and NEON. Al
 
 The first version of this post claimed that `std::simd` ranged from 9x faster to 7.7x slower than scalar code, with interleaved data (RGB, stereo audio) exposing "limitations in the portable SIMD abstraction." That conclusion was wrong, for two separate reasons.
 
-First, the original `std::simd` implementations deinterleaved RGB, widened i16 to i32, and narrowed back with per-element scalar loops and `from_array`. Those loops were the whole cost. Contributors (thanks to [nicofff](https://github.com/nicofff), PRs #3 to #10) replaced them with `from_slice`, `cast`, and `simd_swizzle!`, and the "7.7x slower" cases disappeared.
+First, the original `std::simd` implementations deinterleaved RGB, widened i16 to i32, and narrowed back with per-element scalar loops and `from_array`. Those loops were the whole cost. Readers fixed them: [nicofff](https://github.com/nicofff) rewrote the audio code with `from_slice`, `cast` and `copy_to_slice` and moved the scalar baselines to fixed-point and halving-add (PRs #3, #4, #6, #7); [programmerjake](https://github.com/programmerjake) proposed the `simd_swizzle!` deinterleave for RGB and pointed out that it compiles to a single `ld3` ([#9](https://github.com/Erio-Harrison/simd_benchmark/issues/9)); [sutajo](https://github.com/sutajo) proposed the `simd_swizzle!` approach for the sorted check ([#10](https://github.com/Erio-Harrison/simd_benchmark/issues/10)). With those in, the "7.7x slower" cases disappeared.
 
 Second, even after that, the comparison was not fair. The `std::simd` dot product used `f32x8` while the NEON version used a single `f32x4` accumulator. The `std::simd` byte counter used 32 lanes while NEON used 16. The sorted check used two different algorithms. Every remaining gap in the table traced back to one of these mismatches, not to the API.
 
@@ -183,7 +183,7 @@ The repository now uses the manual-offset form, which is still safe code. That r
 
 **Scenario**: check that 10M i32 values are sorted ascending.
 
-The two implementations used to use different algorithms. `std::simd` built a "previous element" vector with `simd_swizzle!` and compared it to the current chunk, 16 lanes at a time. NEON loaded overlapping windows (`data[i..i+4]` and `data[i+1..i+5]`), 4 lanes at a time. `std::simd` won, 4.70x to 3.58x, and the gap looked like an API difference.
+The two implementations used to use different algorithms. `std::simd` built a "previous element" vector with `simd_swizzle!` (the approach sutajo proposed in #10) and compared it to the current chunk, 16 lanes at a time. NEON loaded overlapping windows (`data[i..i+4]` and `data[i+1..i+5]`), 4 lanes at a time. `std::simd` won, 4.70x to 3.58x, and the gap looked like an API difference.
 
 It was two differences: algorithm and width. NEON has a direct equivalent of the swizzle. `vextq_s32(a, b, 3)` concatenates two vectors and extracts four lanes starting at index 3, giving `[a3, b0, b1, b2]`. That is exactly "shift the previous chunk's last element in front of the current chunk."
 
@@ -272,7 +272,7 @@ let gray_u16 = (r * weight_r + g * weight_g + b * weight_b) >> Simd::splat(8);
 let gray_u8: Simd<u8, 16> = gray_u16.cast();
 ```
 
-I expected the swizzle to lower to table lookups. It does not: LLVM recognizes the every-third-byte pattern and emits `ld3`, the same instruction the NEON code calls through `vld3q_u8`. The scalar version is auto-vectorized with `ld3` as well (see Finding 4), which is why all three rows are within a few percent of each other.
+I expected the swizzle to lower to table lookups. It does not: LLVM recognizes the every-third-byte pattern and emits `ld3`, the same instruction the NEON code calls through `vld3q_u8`. programmerjake spotted this on godbolt when proposing the change in #9; the release assembly of this repository confirms it. The scalar version is auto-vectorized with `ld3` as well (see Finding 4), which is why all three rows are within a few percent of each other.
 
 ### Volume Adjustment and Mixing
 
