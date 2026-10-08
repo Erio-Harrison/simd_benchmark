@@ -7,31 +7,71 @@ use simd_benchmark::{
 };
 use std::time::{Duration, Instant};
 
-const ITERATIONS: u32 = 10;
+/// Warmup budget per implementation before any sample is recorded, so the
+/// process has settled on a performance core at full clock.
+const WARMUP: Duration = Duration::from_millis(100);
+/// Total timed budget per implementation, spread over `ROUNDS` rounds.
+const TIMED: Duration = Duration::from_millis(500);
+/// The implementations of one scenario are measured round-robin
+/// (Scalar, std::simd, NEON, Scalar, ...) so that clock drift, thermal state
+/// and background interference hit all of them equally instead of landing on
+/// whichever one happened to run at the wrong moment.
+const ROUNDS: u32 = 5;
+/// Minimum number of timed iterations per implementation per round.
+const MIN_ITERATIONS_PER_ROUND: usize = 2;
 
-fn benchmark<F>(name: &str, mut f: F) -> Duration
-where
-    F: FnMut(),
-{
-    // Warmup
-    for _ in 0..3 {
-        f();
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Measures every implementation in `impls` and returns the median
+/// per-iteration time of each, in the same order.
+///
+/// A fixed iteration count gives unstable numbers here: a 0.1 ms workload run
+/// 10 times finishes before the clock ramps up, while a 5 ms workload does not.
+/// A time budget equalises that, and the median is robust against the
+/// occasional preempted iteration that would skew a mean.
+fn benchmark_group<const N: usize>(mut impls: [(&str, &mut dyn FnMut()); N]) -> [Duration; N] {
+    for (_, f) in impls.iter_mut() {
+        let start = Instant::now();
+        let mut n = 0;
+        while start.elapsed() < WARMUP || n < 3 {
+            f();
+            n += 1;
+        }
     }
 
-    let start = Instant::now();
-    for _ in 0..ITERATIONS {
-        f();
+    let mut samples: [Vec<Duration>; N] = std::array::from_fn(|_| Vec::new());
+    let per_round = TIMED / ROUNDS;
+    for _ in 0..ROUNDS {
+        for (i, (_, f)) in impls.iter_mut().enumerate() {
+            let start = Instant::now();
+            let mut n = 0;
+            while start.elapsed() < per_round || n < MIN_ITERATIONS_PER_ROUND {
+                let t = Instant::now();
+                f();
+                samples[i].push(t.elapsed());
+                n += 1;
+            }
+        }
     }
-    let elapsed = start.elapsed();
 
-    println!(
-        "  {:12}: {:>10.3}ms ({:.3} ms/iter)",
-        name,
-        elapsed.as_secs_f64() * 1000.0,
-        elapsed.as_secs_f64() * 1000.0 / ITERATIONS as f64
-    );
-
-    elapsed
+    let mut medians = [Duration::ZERO; N];
+    for (i, (name, _)) in impls.iter().enumerate() {
+        let s = &mut samples[i];
+        s.sort();
+        let median = s[s.len() / 2];
+        println!(
+            "  {:12}: {:>9.3} ms/iter  (median of {:>5}, min {:.3}, max {:.3})",
+            name,
+            ms(median),
+            s.len(),
+            ms(s[0]),
+            ms(s[s.len() - 1])
+        );
+        medians[i] = median;
+    }
+    medians
 }
 
 fn print_speedup(scalar_time: Duration, simd_time: Duration, name: &str) {
@@ -63,17 +103,11 @@ fn main() {
     let mut gray_simd = vec![0u8; pixels];
     let mut gray_neon = vec![0u8; pixels];
 
-    let t_scalar = benchmark("Scalar", || {
-        image_processing::scalar::rgb_to_grayscale(&rgb, &mut gray_scalar);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        image_processing::portable_simd::rgb_to_grayscale(&rgb, &mut gray_simd);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        image_processing::neon::rgb_to_grayscale(&rgb, &mut gray_neon);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || image_processing::scalar::rgb_to_grayscale(&rgb, &mut gray_scalar)),
+        ("std::simd", &mut || image_processing::portable_simd::rgb_to_grayscale(&rgb, &mut gray_simd)),
+        ("NEON", &mut || image_processing::neon::rgb_to_grayscale(&rgb, &mut gray_neon)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -89,10 +123,13 @@ fn main() {
     // ========================================================================
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("   Scenario 2: Audio Processing - Volume Adjustment");
-    println!("   Simulating 10s 44.1kHz stereo audio (~880K samples)");
+    println!("   Simulating 60s 44.1kHz stereo audio (~5.3M samples)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let samples = 44100 * 10 * 2; // 10 seconds, 44.1kHz, stereo
+    // 60 seconds, 44.1kHz, stereo. Long enough that one iteration takes a few
+    // hundred microseconds and the working set (~32MB for mixing) is served
+    // from memory like the other scenarios, not from L2.
+    let samples = 44100 * 60 * 2;
     let original: Vec<i16> = (0..samples).map(|i| (i % 65536) as i16).collect();
     let volume = 1.5f32;
 
@@ -100,20 +137,20 @@ fn main() {
     let mut audio_simd = original.clone();
     let mut audio_neon = original.clone();
 
-    let t_scalar = benchmark("Scalar", || {
-        audio_scalar.copy_from_slice(&original);
-        audio_processing::scalar::adjust_volume(&mut audio_scalar, volume);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        audio_simd.copy_from_slice(&original);
-        audio_processing::portable_simd::adjust_volume(&mut audio_simd, volume);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        audio_neon.copy_from_slice(&original);
-        audio_processing::neon::adjust_volume(&mut audio_neon, volume);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || {
+            audio_scalar.copy_from_slice(&original);
+            audio_processing::scalar::adjust_volume(&mut audio_scalar, volume);
+        }),
+        ("std::simd", &mut || {
+            audio_simd.copy_from_slice(&original);
+            audio_processing::portable_simd::adjust_volume(&mut audio_simd, volume);
+        }),
+        ("NEON", &mut || {
+            audio_neon.copy_from_slice(&original);
+            audio_processing::neon::adjust_volume(&mut audio_neon, volume);
+        }),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -140,17 +177,11 @@ fn main() {
     let mut mix_simd = vec![0i16; samples];
     let mut mix_neon = vec![0i16; samples];
 
-    let t_scalar = benchmark("Scalar", || {
-        audio_processing::scalar::mix_tracks(&track_a, &track_b, &mut mix_scalar);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        audio_processing::portable_simd::mix_tracks(&track_a, &track_b, &mut mix_simd);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        audio_processing::neon::mix_tracks(&track_a, &track_b, &mut mix_neon);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || audio_processing::scalar::mix_tracks(&track_a, &track_b, &mut mix_scalar)),
+        ("std::simd", &mut || audio_processing::portable_simd::mix_tracks(&track_a, &track_b, &mut mix_simd)),
+        ("NEON", &mut || audio_processing::neon::mix_tracks(&track_a, &track_b, &mut mix_neon)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -176,17 +207,11 @@ fn main() {
     let mut count_simd = 0;
     let mut count_neon = 0;
 
-    let t_scalar = benchmark("Scalar", || {
-        count_scalar = string_search::scalar::count_byte(&text, b'\n');
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        count_simd = string_search::portable_simd::count_byte(&text, b'\n');
-    });
-
-    let t_neon = benchmark("NEON", || {
-        count_neon = string_search::neon::count_byte(&text, b'\n');
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || count_scalar = string_search::scalar::count_byte(&text, b'\n')),
+        ("std::simd", &mut || count_simd = string_search::portable_simd::count_byte(&text, b'\n')),
+        ("NEON", &mut || count_neon = string_search::neon::count_byte(&text, b'\n')),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -210,17 +235,11 @@ fn main() {
     let mut pos_simd = None;
     let mut pos_neon = None;
 
-    let t_scalar = benchmark("Scalar", || {
-        pos_scalar = string_search::scalar::find_byte(&search_data, b'X');
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        pos_simd = string_search::portable_simd::find_byte(&search_data, b'X');
-    });
-
-    let t_neon = benchmark("NEON", || {
-        pos_neon = string_search::neon::find_byte(&search_data, b'X');
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || pos_scalar = string_search::scalar::find_byte(&search_data, b'X')),
+        ("std::simd", &mut || pos_simd = string_search::portable_simd::find_byte(&search_data, b'X')),
+        ("NEON", &mut || pos_neon = string_search::neon::find_byte(&search_data, b'X')),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -245,17 +264,11 @@ fn main() {
     let mut dot_simd = 0.0;
     let mut dot_neon = 0.0;
 
-    let t_scalar = benchmark("Scalar", || {
-        dot_scalar = numerical::scalar::dot_product(&vec_a, &vec_b);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        dot_simd = numerical::portable_simd::dot_product(&vec_a, &vec_b);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        dot_neon = numerical::neon::dot_product(&vec_a, &vec_b);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || dot_scalar = numerical::scalar::dot_product(&vec_a, &vec_b)),
+        ("std::simd", &mut || dot_simd = numerical::portable_simd::dot_product(&vec_a, &vec_b)),
+        ("NEON", &mut || dot_neon = numerical::neon::dot_product(&vec_a, &vec_b)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -293,17 +306,11 @@ fn main() {
     let mut result_simd = vec![0.0f32; rows];
     let mut result_neon = vec![0.0f32; rows];
 
-    let t_scalar = benchmark("Scalar", || {
-        numerical::scalar::matrix_vector_mul(&matrix, &vector, &mut result_scalar, rows, cols);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        numerical::portable_simd::matrix_vector_mul(&matrix, &vector, &mut result_simd, rows, cols);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        numerical::neon::matrix_vector_mul(&matrix, &vector, &mut result_neon, rows, cols);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || numerical::scalar::matrix_vector_mul(&matrix, &vector, &mut result_scalar, rows, cols)),
+        ("std::simd", &mut || numerical::portable_simd::matrix_vector_mul(&matrix, &vector, &mut result_simd, rows, cols)),
+        ("NEON", &mut || numerical::neon::matrix_vector_mul(&matrix, &vector, &mut result_neon, rows, cols)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -324,17 +331,11 @@ fn main() {
     let mut result_simd = false;
     let mut result_neon = false;
 
-    let t_scalar = benchmark("Scalar", || {
-        result_scalar = validation::scalar::all_in_range(&data, 0, 999);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        result_simd = validation::portable_simd::all_in_range(&data, 0, 999);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        result_neon = validation::neon::all_in_range(&data, 0, 999);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || result_scalar = validation::scalar::all_in_range(&data, 0, 999)),
+        ("std::simd", &mut || result_simd = validation::portable_simd::all_in_range(&data, 0, 999)),
+        ("NEON", &mut || result_neon = validation::neon::all_in_range(&data, 0, 999)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
@@ -352,17 +353,11 @@ fn main() {
 
     let sorted_data: Vec<i32> = (0..10_000_000).map(|i| i as i32).collect();
 
-    let t_scalar = benchmark("Scalar", || {
-        result_scalar = validation::scalar::is_sorted(&sorted_data);
-    });
-
-    let t_simd = benchmark("std::simd", || {
-        result_simd = validation::portable_simd::is_sorted(&sorted_data);
-    });
-
-    let t_neon = benchmark("NEON", || {
-        result_neon = validation::neon::is_sorted(&sorted_data);
-    });
+    let [t_scalar, t_simd, t_neon] = benchmark_group([
+        ("Scalar", &mut || result_scalar = validation::scalar::is_sorted(&sorted_data)),
+        ("std::simd", &mut || result_simd = validation::portable_simd::is_sorted(&sorted_data)),
+        ("NEON", &mut || result_neon = validation::neon::is_sorted(&sorted_data)),
+    ]);
 
     println!();
     print_speedup(t_scalar, t_simd, "std::simd");
