@@ -423,15 +423,20 @@ pub mod string_search {
         /// convert:[0,  1, 0, 0,  1, 0, ...]
         /// sum:    2
         /// ```
+        ///
+        /// Uses 16 lanes (one 128-bit register) to match the NEON implementation,
+        /// so the two approaches process the same bytes per iteration.
+        /// Note: `u8x32::to_bitmask()` has no single NEON instruction and is
+        /// measurably slower than the 16-lane version on aarch64.
         pub fn count_byte(data: &[u8], target: u8) -> usize {
-            let target_vec = u8x32::splat(target);
-            let chunks = data.chunks_exact(32);
+            let target_vec = u8x16::splat(target);
+            let chunks = data.chunks_exact(16);
             let remainder = chunks.remainder();
 
             let mut count = 0usize;
 
             for chunk in chunks {
-                let v = u8x32::from_slice(chunk);
+                let v = u8x16::from_slice(chunk);
                 // simd_eq returns a mask
                 let mask = v.simd_eq(target_vec);
                 // to_bitmask converts mask to bitmap, then count 1s
@@ -446,17 +451,17 @@ pub mod string_search {
 
         /// Find byte position
         pub fn find_byte(data: &[u8], target: u8) -> Option<usize> {
-            let target_vec = u8x32::splat(target);
-            let chunks = data.chunks_exact(32);
+            let target_vec = u8x16::splat(target);
+            let chunks = data.chunks_exact(16);
             let remainder_start = data.len() - chunks.remainder().len();
 
             for (chunk_idx, chunk) in chunks.enumerate() {
-                let v = u8x32::from_slice(chunk);
+                let v = u8x16::from_slice(chunk);
                 let mask = v.simd_eq(target_vec);
                 let bitmask = mask.to_bitmask();
                 if bitmask != 0 {
                     // trailing_zeros gives position of first 1
-                    return Some(chunk_idx * 32 + bitmask.trailing_zeros() as usize);
+                    return Some(chunk_idx * 16 + bitmask.trailing_zeros() as usize);
                 }
             }
 
@@ -598,21 +603,29 @@ pub mod numerical {
         /// ```text
         /// [1.0, 2.0, 3.0, 4.0].reduce_sum() = 10.0
         /// ```
+        ///
+        /// ## Why f32x8 on a 128-bit ISA?
+        ///
+        /// NEON registers hold 4 f32, so `f32x8` is lowered to two registers.
+        /// That gives the loop two *independent* accumulation chains, which is
+        /// what hides FMA latency. The NEON implementation mirrors this with two
+        /// explicit accumulators so the comparison measures the API, not the
+        /// unroll factor.
         pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
             let chunks_a = a.chunks_exact(8);
             let chunks_b = b.chunks_exact(8);
             let remainder_a = chunks_a.remainder();
             let remainder_b = chunks_b.remainder();
 
-            // Use f32x8 (256-bit) for better throughput
             let mut acc = f32x8::splat(0.0);
 
             for (a_chunk, b_chunk) in chunks_a.zip(chunks_b) {
                 let va = f32x8::from_slice(a_chunk);
                 let vb = f32x8::from_slice(b_chunk);
-                // FMA: Fused Multiply-Add, more accurate and faster
-                // acc = acc + va * vb
-                acc += va * vb;
+                // Real fused multiply-add: `acc + va * vb` would NOT be fused
+                // (Rust never contracts float ops), so use `mul_add` explicitly
+                // to match the NEON `vfmaq_f32` instruction.
+                acc = va.mul_add(vb, acc);
             }
 
             let mut result = acc.reduce_sum();
@@ -649,22 +662,34 @@ pub mod numerical {
         ///
         /// `vfmaq_f32(acc, a, b)`: acc + a * b
         /// FMA is faster and more precise than separate multiply + add
+        ///
+        /// ## Two Accumulators
+        ///
+        /// A single `acc = vfmaq_f32(acc, ...)` chain is bound by FMA latency:
+        /// every iteration waits for the previous result. Two independent
+        /// accumulators (8 floats per iteration) let the CPU overlap them. This
+        /// also matches the std::simd `f32x8` version, which the compiler
+        /// lowers to exactly this shape.
         pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
             let len = a.len();
-            let simd_len = len - (len % 4);
+            let simd_len = len - (len % 8);
 
             unsafe {
-                let mut acc = vdupq_n_f32(0.0);
+                let mut acc0 = vdupq_n_f32(0.0);
+                let mut acc1 = vdupq_n_f32(0.0);
 
-                for i in (0..simd_len).step_by(4) {
-                    let va = vld1q_f32(a.as_ptr().add(i));
-                    let vb = vld1q_f32(b.as_ptr().add(i));
-                    // FMA: Fused Multiply-Add
-                    acc = vfmaq_f32(acc, va, vb);
+                for i in (0..simd_len).step_by(8) {
+                    let va0 = vld1q_f32(a.as_ptr().add(i));
+                    let vb0 = vld1q_f32(b.as_ptr().add(i));
+                    let va1 = vld1q_f32(a.as_ptr().add(i + 4));
+                    let vb1 = vld1q_f32(b.as_ptr().add(i + 4));
+                    // FMA: Fused Multiply-Add, two independent chains
+                    acc0 = vfmaq_f32(acc0, va0, vb0);
+                    acc1 = vfmaq_f32(acc1, va1, vb1);
                 }
 
                 // Horizontal sum
-                let mut result = vaddvq_f32(acc);
+                let mut result = vaddvq_f32(vaddq_f32(acc0, acc1));
 
                 for i in simd_len..len {
                     result += a[i] * b[i];
@@ -800,24 +825,27 @@ pub mod validation {
         use std::arch::aarch64::*;
 
         /// NEON range check
+        ///
+        /// Processes 8 elements (two registers) per iteration with a single
+        /// horizontal reduction, mirroring the std::simd `i32x8` version.
         pub fn all_in_range(data: &[i32], min: i32, max: i32) -> bool {
             let len = data.len();
-            let simd_len = len - (len % 4);
+            let simd_len = len - (len % 8);
 
             unsafe {
                 let min_vec = vdupq_n_s32(min);
                 let max_vec = vdupq_n_s32(max);
 
-                for i in (0..simd_len).step_by(4) {
-                    let v = vld1q_s32(data.as_ptr().add(i));
+                for i in (0..simd_len).step_by(8) {
+                    let v0 = vld1q_s32(data.as_ptr().add(i));
+                    let v1 = vld1q_s32(data.as_ptr().add(i + 4));
                     // vcgeq: greater than or equal comparison
                     // vcleq: less than or equal comparison
-                    let ge_min = vcgeq_s32(v, min_vec);
-                    let le_max = vcleq_s32(v, max_vec);
                     // vand: bitwise AND
-                    let both = vandq_u32(ge_min, le_max);
-                    // vminvq: if any 0 exists, returns 0
-                    if vminvq_u32(both) == 0 {
+                    let ok0 = vandq_u32(vcgeq_s32(v0, min_vec), vcleq_s32(v0, max_vec));
+                    let ok1 = vandq_u32(vcgeq_s32(v1, min_vec), vcleq_s32(v1, max_vec));
+                    // vminvq: if any 0 exists, returns 0 (one reduction per 8 elements)
+                    if vminvq_u32(vandq_u32(ok0, ok1)) == 0 {
                         return false;
                     }
                 }
@@ -827,34 +855,52 @@ pub mod validation {
         }
 
         /// NEON sorted check
+        ///
+        /// Same algorithm as the std::simd version: build the "previous element"
+        /// vector with `vextq_s32(prev, cur, 3)` = `[prev[3], cur[0], cur[1], cur[2]]`
+        /// (the NEON equivalent of `simd_swizzle!`), then check `shifted <= cur`.
+        /// Processes 16 elements (four registers) per iteration with one
+        /// horizontal reduction, matching the 16-lane std::simd implementation.
         pub fn is_sorted(data: &[i32]) -> bool {
             if data.len() < 2 {
                 return true;
             }
 
             let len = data.len();
+            let simd_len = len - (len % 16);
 
             unsafe {
-                let mut i = 0;
-                while i + 4 < len {
-                    let current = vld1q_s32(data.as_ptr().add(i));
-                    let next = vld1q_s32(data.as_ptr().add(i + 1));
-                    let le = vcleq_s32(current, next);
-                    if vminvq_u32(le) == 0 {
-                        return false;
-                    }
-                    i += 4;
-                }
+                let mut prev = vdupq_n_s32(data[0]);
 
-                // Check remaining elements
-                for j in i..len - 1 {
-                    if data[j] > data[j + 1] {
+                for i in (0..simd_len).step_by(16) {
+                    let p = data.as_ptr().add(i);
+                    let c0 = vld1q_s32(p);
+                    let c1 = vld1q_s32(p.add(4));
+                    let c2 = vld1q_s32(p.add(8));
+                    let c3 = vld1q_s32(p.add(12));
+
+                    // vext: concatenate two vectors and take 4 lanes starting at index 3
+                    let s0 = vextq_s32(prev, c0, 3);
+                    let s1 = vextq_s32(c0, c1, 3);
+                    let s2 = vextq_s32(c1, c2, 3);
+                    let s3 = vextq_s32(c2, c3, 3);
+
+                    let ok = vandq_u32(
+                        vandq_u32(vcleq_s32(s0, c0), vcleq_s32(s1, c1)),
+                        vandq_u32(vcleq_s32(s2, c2), vcleq_s32(s3, c3)),
+                    );
+                    if vminvq_u32(ok) == 0 {
                         return false;
                     }
+                    prev = c3;
                 }
             }
 
-            true
+            // Remainder: compare the last processed element with the tail
+            let last = if simd_len == 0 { data[0] } else { data[simd_len - 1] };
+            std::iter::once(last)
+                .chain(data[simd_len..].iter().copied())
+                .is_sorted()
         }
     }
 
